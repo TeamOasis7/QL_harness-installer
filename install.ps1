@@ -2,7 +2,8 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\QLHarness'),
     [switch]$NoShortcut,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$NoRegistration
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -19,6 +20,7 @@ public static class QLBootstrapPin {
     [StructLayout(LayoutKind.Sequential)] struct Info { public uint attr,c0,c1,a0,a1,w0,w1,volume,highSize,lowSize,links,high,low; }
     [DllImport("kernel32",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
     [DllImport("kernel32")] static extern bool GetFileInformationByHandle(SafeFileHandle h,out Info info);
+    [DllImport("kernel32",SetLastError=true)] static extern bool SetFileInformationByHandle(SafeFileHandle h,int type,ref int data,uint size);
     [DllImport("kernel32",CharSet=CharSet.Unicode)] static extern bool CreateDirectoryW(string path,IntPtr security);
     public static SafeFileHandle Pin(string path,bool directory) {
         var h=CreateFileW(path,directory?0x80u:0x80000000u,directory?3u:1u,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
@@ -27,6 +29,31 @@ public static class QLBootstrapPin {
             h.Dispose(); throw new InvalidOperationException("Unsafe install path");
         }
         return h;
+    }
+    public static SafeFileHandle PinForDelete(string path) {
+        var h=CreateFileW(path,0x80010000u,1u,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
+        Info i;
+        if(h.IsInvalid||!GetFileInformationByHandle(h,out i)||(i.attr&0x410)!=0||i.links!=1){h.Dispose();throw new InvalidOperationException("Unsafe legacy shortcut");}
+        return h;
+    }
+    public static void DeletePinned(SafeFileHandle handle,string identity,string hash) {
+        if(Identity(handle)!=identity||HashPinned(handle)!=hash) throw new InvalidOperationException("Legacy shortcut changed; preserving it");
+        int remove=1;
+        if(!SetFileInformationByHandle(handle,4,ref remove,4)) throw new InvalidOperationException("Cannot remove legacy shortcut");
+    }
+    public static string Identity(SafeFileHandle handle) {
+        Info i;
+        if(!GetFileInformationByHandle(handle,out i)) throw new InvalidOperationException("Cannot identify legacy shortcut");
+        return i.volume+":"+i.high+":"+i.low+":"+i.c0+":"+i.c1;
+    }
+    public static string HashPinned(SafeFileHandle handle) {
+        using(var borrowed=new SafeFileHandle(handle.DangerousGetHandle(),false))
+        using(var stream=new System.IO.FileStream(borrowed,System.IO.FileAccess.Read))
+        using(var sha=System.Security.Cryptography.SHA256.Create()) {
+            if(stream.Length>1048576) throw new InvalidOperationException("Legacy shortcut exceeds size limit");
+            stream.Position=0;
+            return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-","");
+        }
     }
     public static void NewDirectory(string path) {
         if(!CreateDirectoryW(path,IntPtr.Zero)) throw new InvalidOperationException("Cannot create install directory");
@@ -69,8 +96,43 @@ function Gh-Json([string[]]$arguments) {
     if ($text.Length -gt 2097152) { throw 'GitHub response exceeds limit' }
     return ($text | ConvertFrom-Json)
 }
+function Ensure-NodrShortcut([string]$desktop,[string]$installation,$shell) {
+    $shortcutPath=Join-Path $desktop 'NODR.lnk'
+    if(Test-Path -LiteralPath $shortcutPath){
+        $pins.Add([QLBootstrapPin]::Pin($shortcutPath,$false))
+        if($shell.CreateShortcut($shortcutPath).TargetPath -ine (Join-Path $installation 'Harness.cmd')){throw 'Existing desktop shortcut points elsewhere; preserving it'}
+        return
+    }
+    $stage=Join-Path $desktop ('.ql-harness-'+[Guid]::NewGuid().ToString('N')+'.lnk')
+    if(Test-Path -LiteralPath $stage){throw 'Shortcut staging collision'}
+    $shortcut=$shell.CreateShortcut($stage)
+    $shortcut.TargetPath=Join-Path $installation 'Harness.cmd'
+    $shortcut.WorkingDirectory=$installation
+    $shortcut.Description='NODR'
+    $shortcut.IconLocation=Join-Path $installation 'assets/nodr.ico'
+    $shortcut.Save()
+    $stagePin=[QLBootstrapPin]::Pin($stage,$false)
+    $stagePin.Dispose()
+    [IO.File]::Move($stage,$shortcutPath)
+}
+function Remove-LegacyShortcut([string]$path,[string]$target,$shell,[string]$installation) {
+    # WScript cannot load a link while a DELETE-access handle is open. Bind identity
+    # under a read lock, then reacquire DELETE access and require the same object.
+    $readHandle=[QLBootstrapPin]::Pin($path,$false)
+    try {
+        $identity=[QLBootstrapPin]::Identity($readHandle)
+        $hash=[QLBootstrapPin]::HashPinned($readHandle)
+        $same=$shell.CreateShortcut($path).TargetPath -ieq $target
+    } finally {$readHandle.Dispose()}
+    if(-not $same){return}
+    if($installation){Ensure-NodrShortcut (Split-Path -Parent $path) $installation $shell}
+    $handle=[QLBootstrapPin]::PinForDelete($path)
+    try {
+        [QLBootstrapPin]::DeletePinned($handle,$identity,$hash)
+    } finally {$handle.Dispose()}
+}
 try {
-    if (-not [Environment]::Is64BitOperatingSystem) { throw 'QL Harness requires 64-bit Windows' }
+    if (-not [Environment]::Is64BitOperatingSystem) { throw 'NODR requires 64-bit Windows' }
     if ($root -eq [IO.Path]::GetPathRoot($root)) { throw 'Choose an application installation directory' }
     $chain = [Collections.Generic.List[string]]::new()
     $ancestor = [IO.DirectoryInfo]::new($root)
@@ -81,7 +143,7 @@ try {
     $oldFiles = @{}
     $portableTool = $null
     if ($rootExisted) {
-        if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Existing directory is not a QL Harness installation; choose another InstallRoot' }
+        if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Existing directory is not a NODR installation; choose another InstallRoot' }
         $markerPin = [QLBootstrapPin]::Pin($marker,$false)
         $markerPin.Dispose()
         if ((Get-Item -LiteralPath $marker).Length -gt 16384) { throw 'Invalid install marker size' }
@@ -94,6 +156,7 @@ try {
         Atomic-Bytes $marker ([Text.Encoding]::UTF8.GetBytes(($initial | ConvertTo-Json -Compress)))
     }
     Ensure-PinnedDirectory (Join-Path $root 'scripts')
+    Ensure-PinnedDirectory (Join-Path $root 'assets')
     $ghCommand = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($ghCommand) { $gh = $ghCommand.Source }
     elseif ($portableTool) {
@@ -147,17 +210,27 @@ try {
     } finally { $ErrorActionPreference = $savedErrorPreference }
     if ($authExit -ne 0) {
         if ($NonInteractive) { throw 'GitHub authentication is required; rerun interactively to sign in' }
-        Write-Host 'Sign in with a GitHub account that can access your private Harness repository.'
+        Write-Host 'Sign in with a GitHub account that can access your private NODR repository.'
         & $gh auth login --hostname github.com --git-protocol https --web
         if ($LASTEXITCODE -ne 0) { throw 'GitHub authentication was not completed' }
     }
     $commit = Gh-Json @('api','--hostname','github.com',('repos/'+$repository+'/commits/main'))
     if ($commit.sha -cnotmatch '^[a-f0-9]{40}$') { throw 'Invalid private repository commit' }
-    $names = @('latest-verified-release.json','Install.cmd','Harness.cmd','scripts/install-verified-release.ps1','scripts/open-verified-release.ps1')
+    $sourcePaths = [ordered]@{
+        'latest-verified-release.json'='latest-verified-release.json'
+        'Install.cmd'='Install.cmd'
+        'Harness.cmd'='Harness.cmd'
+        'scripts/install-verified-release.ps1'='scripts/install-verified-release.ps1'
+        'scripts/open-verified-release.ps1'='scripts/open-verified-release.ps1'
+        'scripts/uninstall-user-install.ps1'='scripts/uninstall-user-install.ps1'
+        'assets/nodr.ico'='apps/harness-desktop/assets/nodr.ico'
+    }
+    $names = @($sourcePaths.Keys)
     $prepared = @{}
     foreach ($name in $names) {
-        $entry = Gh-Json @('api','--hostname','github.com',('repos/'+$repository+'/contents/'+$name+'?ref='+$commit.sha))
-        if ($entry.type -cne 'file' -or $entry.path -cne $name -or $entry.encoding -cne 'base64' -or $entry.size -gt 262144) { throw 'Invalid private installation file' }
+        $sourcePath = $sourcePaths[$name]
+        $entry = Gh-Json @('api','--hostname','github.com',('repos/'+$repository+'/contents/'+$sourcePath+'?ref='+$commit.sha))
+        if ($entry.type -cne 'file' -or $entry.path -cne $sourcePath -or $entry.encoding -cne 'base64' -or $entry.size -gt 262144) { throw 'Invalid private installation file' }
         $bytes = [Convert]::FromBase64String($entry.content)
         $sha1 = [Security.Cryptography.SHA1]::Create()
         try {
@@ -181,7 +254,8 @@ try {
         if (-not (Test-Path -LiteralPath $target) -or (File-Hash $target) -cne $prepared[$name].hash) { Atomic-Bytes $target $prepared[$name].bytes }
         $newFiles[$name] = $prepared[$name].hash
     }
-    $state = @{schema='ql-harness-user-install/v1';repository=$repository;commit=$commit.sha;files=$newFiles;tool=$portableTool}
+    $releasePointer=[Text.Encoding]::UTF8.GetString($prepared['latest-verified-release.json'].bytes)|ConvertFrom-Json
+    $state = @{schema='ql-harness-user-install/v1';repository=$repository;commit=$commit.sha;files=$newFiles;tool=$portableTool;release=$releasePointer}
     Atomic-Bytes $marker ([Text.Encoding]::UTF8.GetBytes(($state | ConvertTo-Json -Depth 4 -Compress)))
     $savedPath = $env:PATH
     $savedGhHost = $env:GH_HOST
@@ -189,7 +263,7 @@ try {
         $env:PATH = (Split-Path -Parent $gh) + ';' + $savedPath
         $env:GH_HOST = 'github.com'
         & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\install-verified-release.ps1')
-        if ($LASTEXITCODE -ne 0) { throw 'Harness executable installation failed' }
+        if ($LASTEXITCODE -ne 0) { throw 'NODR executable installation failed' }
     } finally { $env:PATH = $savedPath; $env:GH_HOST = $savedGhHost }
     if (-not $NoShortcut) {
         $desktop = [Environment]::GetFolderPath('Desktop')
@@ -197,25 +271,26 @@ try {
         $ancestor = [IO.DirectoryInfo]::new($desktop)
         while ($ancestor) { $desktopChain.Insert(0,$ancestor.FullName); $ancestor=$ancestor.Parent }
         foreach ($directory in $desktopChain) { $pins.Add([QLBootstrapPin]::Pin($directory,$true)) }
-        $shortcutPath = Join-Path $desktop 'QL Harness.lnk'
         $shell = New-Object -ComObject WScript.Shell
-        if (Test-Path -LiteralPath $shortcutPath) {
-            $pins.Add([QLBootstrapPin]::Pin($shortcutPath,$false))
-            if ($shell.CreateShortcut($shortcutPath).TargetPath -ine (Join-Path $root 'Harness.cmd')) { throw 'Existing desktop shortcut points elsewhere; preserving it' }
-        } else {
-            $stage = Join-Path $desktop ('.ql-harness-'+[Guid]::NewGuid().ToString('N')+'.lnk')
-            if (Test-Path -LiteralPath $stage) { throw 'Shortcut staging collision' }
-            $shortcut = $shell.CreateShortcut($stage)
-            $shortcut.TargetPath = Join-Path $root 'Harness.cmd'
-            $shortcut.WorkingDirectory = $root
-            $shortcut.Description = 'QL Harness'
-            $shortcut.Save()
-            $stagePin = [QLBootstrapPin]::Pin($stage,$false)
-            $stagePin.Dispose()
-            [IO.File]::Move($stage,$shortcutPath)
+        Ensure-NodrShortcut $desktop $root $shell
+        # Remove only former product links that still resolve to this installation.
+        foreach($legacyDesktop in @($desktop,(Join-Path $env:USERPROFILE 'Desktop'))|Select-Object -Unique){
+            if(-not(Test-Path -LiteralPath $legacyDesktop -PathType Container)){continue}
+            $legacyChain=[Collections.Generic.List[string]]::new()
+            $legacyAncestor=[IO.DirectoryInfo]::new($legacyDesktop)
+            while($legacyAncestor){$legacyChain.Insert(0,$legacyAncestor.FullName);$legacyAncestor=$legacyAncestor.Parent}
+            foreach($directory in $legacyChain){$pins.Add([QLBootstrapPin]::Pin($directory,$true))}
+            $legacyLink=Join-Path $legacyDesktop 'QL Harness.lnk'
+            if(Test-Path -LiteralPath $legacyLink){
+                Remove-LegacyShortcut $legacyLink (Join-Path $root 'Harness.cmd') $shell $root
+            }
         }
     }
-    Write-Host ('QL Harness installed. Open '+(Join-Path $root 'Harness.cmd'))
+    if(-not $NoRegistration){
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\uninstall-user-install.ps1') -Register -NonInteractive
+        if($LASTEXITCODE -ne 0){throw 'NODR application registration failed'}
+    }
+    Write-Host ('NODR installed. Open '+(Join-Path $root 'Harness.cmd'))
 } finally {
     foreach ($pin in $pins) { $pin.Dispose() }
 }
